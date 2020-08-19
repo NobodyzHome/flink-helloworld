@@ -1,0 +1,8 @@
+spring:
+  task:
+    execution:
+      pool:
+        keep-alive: 120s
+        max-size: 200
+        core-size: 100
+        queue-capacity: 50
