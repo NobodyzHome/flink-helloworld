@@ -1,30 +1,28 @@
 package com.mzq.usage.flink;
 
 import com.mzq.usage.flink.domain.*;
+import com.mzq.usage.flink.func.sink.TestSink;
 import com.mzq.usage.flink.func.source.*;
-import org.apache.flink.api.common.functions.AggregateFunction;
-import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.functions.RichFilterFunction;
-import org.apache.flink.api.common.functions.RichMapFunction;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.flink.api.common.functions.*;
 import org.apache.flink.api.common.state.*;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.DataStreamSource;
-import org.apache.flink.streaming.api.datastream.KeyedStream;
-import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.datastream.*;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.streaming.api.functions.ProcessFunction;
-import org.apache.flink.streaming.api.functions.co.CoFlatMapFunction;
 import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
+import org.apache.flink.streaming.api.functions.co.RichCoMapFunction;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
 import org.junit.Test;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.stream.Stream;
 
 /**
  * 为什么要使用state?
@@ -35,6 +33,10 @@ import java.util.*;
  * <p>
  * 大部分使用state的场景都是在keyedStream中使用，这样流按照key被逻辑拆分，同时从这个流中获取的state也会按key来拆分。同一个key的元素共享同一个内容，也就是说不同key的state值是不同的。
  * 我们使用state，主要就是让算子记录过往经历过这个算子的数据，好让这个算子在新来元素时可以使用这些经过该算子的过往的数据和当前数据一起进行计算
+ * <p>
+ * 因此state的作用：
+ * 1.对于处理一个流的算子（例如map），就是记录每个key在过往的数据中的内容，说白了就是处理当前消息时，需要历史消息的数据
+ * 2.对于处理两个流的算子（例如connect），可以将同一个Key中的过往的数据进行共享，达到两个流在处理时进行通信的目的（就是在处理流A的消息时，需要流B的内容），说白了就是处理当前流的消息时，需要另外一个流的数据
  */
 public class StateTest {
 
@@ -527,10 +529,12 @@ public class StateTest {
     @Test
     public void testState() throws Exception {
         StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
+        streamExecutionEnvironment.enableCheckpointing(5000);
+
         DataStreamSource<ProductIncome> productStreamSource = streamExecutionEnvironment.addSource(new ProductSource());
         DataStreamSource<ProductSale> productSaleStreamSource = streamExecutionEnvironment.addSource(new ProductSaleSource());
-
-        SingleOutputStreamOperator<Tuple3<String, Integer, Double>> produceWithSaleStream = productStreamSource.connect(productSaleStreamSource).keyBy(ProductIncome::getProductName, ProductSale::getProductName)
+        SingleOutputStreamOperator<Tuple3<String, Integer, Double>> produceWithSaleStream = productStreamSource.connect(productSaleStreamSource)
+                .keyBy(ProductIncome::getProductName, ProductSale::getProductName)
                 .flatMap(new RichCoFlatMapFunction<ProductIncome, ProductSale, Tuple3<String, Integer, Double>>() {
                     private ValueState<Double> saleState;
                     private ListState<Integer> incomeState;
@@ -572,17 +576,358 @@ public class StateTest {
                             incomeState.clear();
                         }
                     }
-                });
+                }).setParallelism(1);
 
-        produceWithSaleStream.print("meta data:");
-        SingleOutputStreamOperator<ProductIncome> realProductIncomeStream = produceWithSaleStream.map(new MapFunction<Tuple3<String, Integer, Double>, ProductIncome>() {
+        produceWithSaleStream.print("meta data:").setParallelism(3);
+        OutputTag<ProductIncome> outputTag = new OutputTag<>("less-summary", Types.GENERIC(ProductIncome.class));
+        SingleOutputStreamOperator<ProductIncome> realProductIncomeStream = produceWithSaleStream.keyBy(tuple -> tuple.f0).process(new KeyedProcessFunction<String, Tuple3<String, Integer, Double>, ProductIncome>() {
+            private AggregatingState<Tuple2<Integer, Double>, BigDecimal> summaryState;
+
             @Override
-            public ProductIncome map(Tuple3<String, Integer, Double> value) throws Exception {
-                return new ProductIncome(value.f0, new BigDecimal(value.f1).multiply(BigDecimal.valueOf(value.f2)).intValue());
+            public void open(Configuration parameters) throws Exception {
+                AggregatingStateDescriptor<Tuple2<Integer, Double>, List<Tuple2<Integer, Double>>, BigDecimal> aggregatingStateDescriptor = new AggregatingStateDescriptor<>("summary-state"
+                        , new AggregateFunction<Tuple2<Integer, Double>, List<Tuple2<Integer, Double>>, BigDecimal>() {
+                    @Override
+                    public List<Tuple2<Integer, Double>> createAccumulator() {
+                        return new ArrayList<>();
+                    }
+
+                    @Override
+                    public List<Tuple2<Integer, Double>> add(Tuple2<Integer, Double> value, List<Tuple2<Integer, Double>> accumulator) {
+                        accumulator.add(value);
+                        return accumulator;
+                    }
+
+                    @Override
+                    public BigDecimal getResult(List<Tuple2<Integer, Double>> accumulator) {
+                        return accumulator.stream().map(tuple2 -> BigDecimal.valueOf(tuple2.f0).multiply(BigDecimal.valueOf(tuple2.f1))).reduce(BigDecimal.ZERO, BigDecimal::add);
+                    }
+
+                    @Override
+                    public List<Tuple2<Integer, Double>> merge(List<Tuple2<Integer, Double>> a, List<Tuple2<Integer, Double>> b) {
+                        a.addAll(b);
+                        return a;
+                    }
+                }, Types.LIST(Types.TUPLE(Types.INT, Types.DOUBLE)));
+
+                summaryState = getRuntimeContext().getAggregatingState(aggregatingStateDescriptor);
+            }
+
+            @Override
+            public void processElement(Tuple3<String, Integer, Double> value, Context ctx, Collector<ProductIncome> out) throws Exception {
+                summaryState.add(Tuple2.of(value.f1, value.f2));
+                BigDecimal summary = summaryState.get();
+
+                int income = BigDecimal.valueOf(value.f1).multiply(BigDecimal.valueOf(value.f2)).intValue();
+                ProductIncome productIncome = new ProductIncome(ctx.getCurrentKey(), income);
+                productIncome.setSummary(summary.intValue());
+                if (productIncome.getSummary() >= 3000) {
+                    out.collect(productIncome);
+                } else {
+                    ctx.output(outputTag, productIncome);
+                }
+            }
+        }).setParallelism(5);
+
+        realProductIncomeStream.print("more summary:").setParallelism(2);
+        DataStream<ProductIncome> lessSummaryStream = realProductIncomeStream.getSideOutput(outputTag);
+        lessSummaryStream.print("less summary:").setParallelism(3);
+        streamExecutionEnvironment.execute();
+    }
+
+    @Test
+    public void test() throws Exception {
+        StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
+        DataStreamSource<WaybillC> waybillCDataStreamSource = streamExecutionEnvironment.addSource(new WaybillCSource());
+        DataStreamSource<WaybillE> waybillEDataStreamSource = streamExecutionEnvironment.addSource(new WaybillESource());
+        DataStreamSource<WaybillM> waybillMDataStreamSource = streamExecutionEnvironment.addSource(new WaybillMSource());
+        DataStreamSource<WaybillOrder> waybillOrderDataStreamSource = streamExecutionEnvironment.addSource(new WaybillOrderSource());
+        DataStreamSource<Order> orderDataStreamSource = streamExecutionEnvironment.addSource(new OrderSource());
+        DataStreamSource<WaybillRouteLink> waybillRouteLinkDataStreamSource = streamExecutionEnvironment.addSource(new WaybillRouteLinkSource());
+
+        SingleOutputStreamOperator<WaybillCEM> waybillCMap = waybillCDataStreamSource.map(new MapFunction<WaybillC, WaybillCEM>() {
+            @Override
+            public WaybillCEM map(WaybillC value) throws Exception {
+                WaybillCEM waybillCEM = new WaybillCEM();
+                waybillCEM.setWaybillCode(value.getWaybillCode());
+                waybillCEM.setWaybillSign(value.getWaybillSign());
+                waybillCEM.setSiteCode(value.getSiteCode());
+                waybillCEM.setSiteName(value.getSiteName());
+                return waybillCEM;
             }
         });
 
+        SingleOutputStreamOperator<WaybillCEM> waybillEMap = waybillEDataStreamSource.map(new MapFunction<WaybillE, WaybillCEM>() {
+            @Override
+            public WaybillCEM map(WaybillE value) throws Exception {
+                WaybillCEM waybillCEM = new WaybillCEM();
+                waybillCEM.setWaybillCode(value.getWaybillCode());
+                waybillCEM.setBusiNo(value.getBusiNo());
+                waybillCEM.setBusiName(value.getBusiName());
+                waybillCEM.setSendPay(value.getSendPay());
+                return waybillCEM;
+            }
+        });
+
+        SingleOutputStreamOperator<WaybillCEM> waybillMMap = waybillMDataStreamSource.map(new MapFunction<WaybillM, WaybillCEM>() {
+            @Override
+            public WaybillCEM map(WaybillM value) throws Exception {
+                WaybillCEM waybillCEM = new WaybillCEM();
+                waybillCEM.setWaybillCode(value.getWaybillCode());
+                waybillCEM.setPickupDate(value.getPickupDate());
+                waybillCEM.setDeliveryDate(value.getDeliveryDate());
+                return waybillCEM;
+            }
+        });
+
+        SingleOutputStreamOperator<WaybillCEM> waybillCEMStream = waybillCMap.union(waybillEMap, waybillMMap).keyBy(WaybillCEM::getWaybillCode).reduce(new ReduceFunction<WaybillCEM>() {
+            @Override
+            public WaybillCEM reduce(WaybillCEM value1, WaybillCEM value2) throws Exception {
+                Optional.ofNullable(value1.getWaybillCode()).ifPresent(value2::setWaybillCode);
+                Optional.ofNullable(value1.getWaybillSign()).ifPresent(value2::setWaybillSign);
+                Optional.ofNullable(value1.getSiteCode()).ifPresent(value2::setSiteCode);
+                Optional.ofNullable(value1.getSiteName()).ifPresent(value2::setSiteName);
+                Optional.ofNullable(value1.getBusiName()).ifPresent(value2::setBusiName);
+                Optional.ofNullable(value1.getBusiNo()).ifPresent(value2::setBusiNo);
+                Optional.ofNullable(value1.getSendPay()).ifPresent(value2::setSendPay);
+                Optional.ofNullable(value1.getDeliveryDate()).ifPresent(value2::setDeliveryDate);
+                Optional.ofNullable(value1.getPickupDate()).ifPresent(value2::setPickupDate);
+
+                return value2;
+            }
+        });
+
+        SingleOutputStreamOperator<WaybillCEMRouteLink> waybillCEMRouteLinkStream = waybillCEMStream.connect(waybillRouteLinkDataStreamSource)
+                .keyBy(WaybillCEM::getWaybillCode, WaybillRouteLink::getWaybillCode)
+                .flatMap(new RichCoFlatMapFunction<WaybillCEM, WaybillRouteLink, WaybillCEMRouteLink>() {
+                    private ValueState<WaybillCEM> waybillCEMState;
+                    private MapState<String, Date> packageState;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        waybillCEMState = getRuntimeContext().getState(new ValueStateDescriptor<>("waybill-cem-state", Types.GENERIC(WaybillCEM.class)));
+                        packageState = getRuntimeContext().getMapState(new MapStateDescriptor<>("route-link-state", Types.STRING, Types.GENERIC(Date.class)));
+                    }
+
+                    @Override
+                    public void flatMap1(WaybillCEM value, Collector<WaybillCEMRouteLink> out) throws Exception {
+                        waybillCEMState.update(value);
+
+                        WaybillCEMRouteLink waybillCEMRouteLink = new WaybillCEMRouteLink();
+                        waybillCEMRouteLink.setWaybillCode(value.getWaybillCode());
+                        waybillCEMRouteLink.setWaybillSign(value.getWaybillSign());
+                        waybillCEMRouteLink.setSiteCode(value.getSiteCode());
+                        waybillCEMRouteLink.setSiteName(value.getSiteName());
+                        waybillCEMRouteLink.setBusiNo(value.getBusiNo());
+                        waybillCEMRouteLink.setBusiName(value.getBusiName());
+                        waybillCEMRouteLink.setSendPay(value.getSendPay());
+                        waybillCEMRouteLink.setPickupDate(value.getPickupDate());
+                        waybillCEMRouteLink.setDeliveryDate(value.getDeliveryDate());
+
+                        boolean hasPackage = false;
+                        for (Map.Entry<String, Date> entry : packageState.entries()) {
+                            waybillCEMRouteLink.setPackageCode(entry.getKey());
+                            waybillCEMRouteLink.setStaticDeliveryTime(entry.getValue());
+                            hasPackage = true;
+                            out.collect(waybillCEMRouteLink);
+                        }
+
+                        if (hasPackage) {
+                            packageState.clear();
+                        }
+                    }
+
+                    @Override
+                    public void flatMap2(WaybillRouteLink value, Collector<WaybillCEMRouteLink> out) throws Exception {
+                        WaybillCEM waybillCEM = waybillCEMState.value();
+                        if (Objects.nonNull(waybillCEM)) {
+                            WaybillCEMRouteLink waybillCEMRouteLink = new WaybillCEMRouteLink();
+                            waybillCEMRouteLink.setWaybillCode(waybillCEM.getWaybillCode());
+                            waybillCEMRouteLink.setWaybillSign(waybillCEM.getWaybillSign());
+                            waybillCEMRouteLink.setSiteCode(waybillCEM.getSiteCode());
+                            waybillCEMRouteLink.setSiteName(waybillCEM.getSiteName());
+                            waybillCEMRouteLink.setBusiNo(waybillCEM.getBusiNo());
+                            waybillCEMRouteLink.setBusiName(waybillCEM.getBusiName());
+                            waybillCEMRouteLink.setSendPay(waybillCEM.getSendPay());
+                            waybillCEMRouteLink.setPickupDate(waybillCEM.getPickupDate());
+                            waybillCEMRouteLink.setDeliveryDate(waybillCEM.getDeliveryDate());
+                            waybillCEMRouteLink.setPackageCode(value.getPackageCode());
+                            waybillCEMRouteLink.setStaticDeliveryTime(value.getStaticDeliveryTime());
+
+                            out.collect(waybillCEMRouteLink);
+                        } else {
+                            packageState.put(value.getPackageCode(), value.getStaticDeliveryTime());
+                        }
+                    }
+                });
+
+        SingleOutputStreamOperator<Tuple3<String, String, Date>> orderStream = waybillOrderDataStreamSource.connect(orderDataStreamSource).keyBy(WaybillOrder::getOrderId, Order::getOrderCode)
+                .flatMap(new RichCoFlatMapFunction<WaybillOrder, Order, Tuple3<String, String, Date>>() {
+                    private ListState<String> waybillListState;
+                    private ValueState<Date> valueState;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        waybillListState = getRuntimeContext().getListState(new ListStateDescriptor<String>("waybill-list", Types.STRING));
+                        valueState = getRuntimeContext().getState(new ValueStateDescriptor<Date>("order-state", Types.GENERIC(Date.class)));
+                    }
+
+                    @Override
+                    public void flatMap1(WaybillOrder value, Collector<Tuple3<String, String, Date>> out) throws Exception {
+                        Date staticDeliveryDate = valueState.value();
+                        out.collect(Tuple3.of(value.getWaybillCode(), value.getOrderId(), staticDeliveryDate));
+
+                        if (Objects.isNull(staticDeliveryDate)) {
+                            waybillListState.add(value.getWaybillCode());
+                        }
+                    }
+
+                    @Override
+                    public void flatMap2(Order value, Collector<Tuple3<String, String, Date>> out) throws Exception {
+                        valueState.update(value.getCreateTime());
+                        boolean hasWaybill = false;
+                        for (String waybillCode : waybillListState.get()) {
+                            out.collect(Tuple3.of(waybillCode, value.getOrderCode(), value.getCreateTime()));
+                            hasWaybill = true;
+                        }
+                        if (hasWaybill) {
+                            waybillListState.clear();
+                        }
+                    }
+                });
+
+        SingleOutputStreamOperator<BdWaybillOrder> bdWaybillOrderStream = waybillCEMRouteLinkStream.connect(orderStream)
+                .keyBy(WaybillCEMRouteLink::getWaybillCode, new KeySelector<Tuple3<String, String, Date>, String>() {
+                    @Override
+                    public String getKey(Tuple3<String, String, Date> value) throws Exception {
+                        return value.f0;
+                    }
+                }).flatMap(new RichCoFlatMapFunction<WaybillCEMRouteLink, Tuple3<String, String, Date>, BdWaybillOrder>() {
+                    private ListState<WaybillCEMRouteLink> routeLinkState;
+                    private ValueState<Order> orderState;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        routeLinkState = getRuntimeContext().getListState(new ListStateDescriptor<WaybillCEMRouteLink>("waybill-state", Types.GENERIC(WaybillCEMRouteLink.class)));
+                        orderState = getRuntimeContext().getState(new ValueStateDescriptor<Order>("order-state", Types.GENERIC(Order.class)));
+                    }
+
+                    @Override
+                    public void flatMap1(WaybillCEMRouteLink value, Collector<BdWaybillOrder> out) throws Exception {
+                        Order order = orderState.value();
+                        if (Objects.isNull(order)) {
+                            routeLinkState.add(value);
+                        } else {
+                            BdWaybillOrder bdWaybillOrder = new BdWaybillOrder();
+                            bdWaybillOrder.setWaybillCode(value.getWaybillCode());
+                            bdWaybillOrder.setWaybillSign(value.getWaybillSign());
+                            bdWaybillOrder.setSiteCode(value.getSiteCode());
+                            bdWaybillOrder.setSiteName(value.getSiteName());
+                            bdWaybillOrder.setBusiNo(value.getBusiNo());
+                            bdWaybillOrder.setBusiName(value.getBusiName());
+                            bdWaybillOrder.setSendPay(value.getSendPay());
+                            bdWaybillOrder.setPickupDate(value.getPickupDate());
+                            bdWaybillOrder.setDeliveryDate(value.getDeliveryDate());
+                            bdWaybillOrder.setPackageCode(value.getPackageCode());
+                            bdWaybillOrder.setOrderCode(order.getOrderCode());
+                            bdWaybillOrder.setOrderCreateDate(order.getCreateTime());
+
+                            out.collect(bdWaybillOrder);
+                        }
+                    }
+
+                    @Override
+                    public void flatMap2(Tuple3<String, String, Date> value, Collector<BdWaybillOrder> out) throws Exception {
+                        Order order = new Order();
+                        order.setOrderCode(value.f1);
+                        order.setCreateTime(value.f2);
+                        orderState.update(order);
+
+                        boolean hasWaybill = false;
+                        for (WaybillCEMRouteLink waybillCEMRouteLink : routeLinkState.get()) {
+                            BdWaybillOrder bdWaybillOrder = new BdWaybillOrder();
+                            bdWaybillOrder.setWaybillCode(waybillCEMRouteLink.getWaybillCode());
+                            bdWaybillOrder.setWaybillSign(waybillCEMRouteLink.getWaybillSign());
+                            bdWaybillOrder.setSiteCode(waybillCEMRouteLink.getSiteCode());
+                            bdWaybillOrder.setSiteName(waybillCEMRouteLink.getSiteName());
+                            bdWaybillOrder.setBusiNo(waybillCEMRouteLink.getBusiNo());
+                            bdWaybillOrder.setBusiName(waybillCEMRouteLink.getBusiName());
+                            bdWaybillOrder.setSendPay(waybillCEMRouteLink.getSendPay());
+                            bdWaybillOrder.setPickupDate(waybillCEMRouteLink.getPickupDate());
+                            bdWaybillOrder.setDeliveryDate(waybillCEMRouteLink.getDeliveryDate());
+                            bdWaybillOrder.setPackageCode(waybillCEMRouteLink.getPackageCode());
+                            bdWaybillOrder.setOrderCode(order.getOrderCode());
+                            bdWaybillOrder.setOrderCreateDate(order.getCreateTime());
+
+                            out.collect(bdWaybillOrder);
+                            hasWaybill = true;
+                        }
+                        if (hasWaybill) {
+                            routeLinkState.clear();
+                        }
+                    }
+                });
+
+        bdWaybillOrderStream.print();
+        streamExecutionEnvironment.execute();
+    }
+
+    /**
+     * 1.operator state是针对算子实例的，也就是说每个算子实例存储的state的值是不同的，取决于经过这个算子实例的元素。
+     * 2.operator state只可以使用ListState这种结构的，其他结构的只有在Keyed算子中才可以使用
+     * 3.如果需要使用operator state，那么需要在对应算子的function实现类中，增加实现CheckpointedFunction方法。
+     * flink会调用CheckpointedFunction的initializeState方法，通过FunctionInitializationContext对象来获取operator sate
+     * <p>
+     * operator state逻辑意义上可以想像成：
+     * ---------------------------------------------------
+     * 算子实例                  operate state
+     * ---------------------------------------------------
+     * map算子实例1              [e1,e5,e8,e9]
+     * ---------------------------------------------------
+     * map算子实例2              [e2,e3,e7]
+     * ---------------------------------------------------
+     * map算子实例3              [e4,e6,e10,e11]
+     * ---------------------------------------------------
+     */
+    @Test
+    public void testOperatorState() throws Exception {
+        StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
+        DataStreamSource<Integer> integerDataStreamSource = streamExecutionEnvironment
+                .fromElements(2, 8, 4, 3, 14, 7, 23, 46, 98, 3, 21, 3, 4, 7, 1);
+        DataStreamSink<Integer> testSink = integerDataStreamSource.addSink(new TestSink());
+        testSink.setParallelism(5);
 
         streamExecutionEnvironment.execute();
+    }
+
+
+    /**
+     * 一、可以设置何种情况会刷新state的ttl
+     * 我们可以通过设置setUpdateType方法，来设置何种情况会刷新state的ttl。枚举OnCreateAndWrite代表在创建和写入state时会刷新state的ttl，
+     * 枚举OnReadAndWrite代表在读取state时，也会刷新state的ttl
+     * <p>
+     * 二、可以设置是否能获取过期的state
+     * 我们可以通过setStateVisibility方法来设置过期的state是否可见。由于过期的state不会马上被清除，因此理论上是可以看到过期的state的数据的。
+     * 设置该方法就可以设置是否能获取过期的state。枚举NeverReturnExpired代表不能获取过期的state，枚举ReturnExpiredIfNotCleanedUp代表过期
+     * 但没有清除的state。
+     * 但是注意：假如我获取到了一个过期的state的数据，那么就会触发默认的清除策略：就是在访问state后，如果这个state过期了，就清除这个state。
+     * <p>
+     * 三、设置清除过期state的策略
+     * 当state过期后，不像redis，flink不会马上清除这个state。而是会在以下清除策略触发时才会清除state
+     * 1.当一个state过期了，那么会在下一次读取这个state的数据后，删除这个state中的数据。注意：这个策略是无论如何都会触发的。
+     * <p>
+     * 2.默认情况下，flink也会间歇性的在后台删除过期的state。
+     * 我们可以通过设置disableCleanupInBackground方法来停止后台删除过期state的策略。
+     * <p>
+     * 3.我们可以设置在完成一次checkpoint后，进行一次state清除，清除过期的state
+     * cleanupFullSnapshot方法用于设置在完成一次checkpoint
+     * <p>
+     * 4.我们可以设置增量清除，在每次访问state或算子处理一条数据时，增量查询N个state，判断这些state是否过期，如果过期就删除
+     * cleanupIncrementally(10, true)方法用于设置增量清除过期的state，第一个入参10代表每次触发增量清理时，要检查的state实体的个数，
+     * 第二个入参true代表当算子处理元素时，是否要触发增量清理state。如果为false，那么只有访问state才会触发增量清理
+     */
+    @Test
+    public void testStateExpire() {
+
     }
 }
