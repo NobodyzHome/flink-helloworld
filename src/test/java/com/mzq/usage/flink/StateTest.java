@@ -930,4 +930,15 @@ public class StateTest {
     public void testStateExpire() {
 
     }
+
+    /**
+     * 注意：
+     * 和state一样，counter也是和算子走的，每个算子的值是不同的。例如map算子的并行度是5，那么假设第一个算子实例调用了三次add(1)方法，那么在这个算子的counter值是3，而其他算子实例的counter由于还没有调用过add方法，因此
+     * 其他算子实力的counter的值还是0。
+     * 因此可以看到，每个算子实例的counter值是不同的，取决于在这个算子实例中调用了多少次counter的add方法。
+     */
+    @Test
+    public void testCounter(){
+
+    }
 }

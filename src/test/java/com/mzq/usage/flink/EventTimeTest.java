@@ -5,6 +5,8 @@ import com.mzq.usage.flink.func.source.WaybillCSource;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.ExecutionEnvironment;
+import org.apache.flink.api.java.operators.DataSource;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.tuple.Tuple4;
@@ -423,6 +425,19 @@ public class EventTimeTest {
         // 获取旁路流中的数据，在这里是获取被丢弃的数据
         DataStream<Integer> lateStream = aggregateStream.getSideOutput(lateTag);
         lateStream.print("late output:").setParallelism(2);
+        streamExecutionEnvironment.execute();
+    }
+
+    @Test
+    public void test1() throws Exception {
+        StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
+        streamExecutionEnvironment.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+        DataStreamSource<Tuple2<String, Long>> tuple2DataStreamSource = streamExecutionEnvironment.fromElements(Tuple2.of("hello", 0L), Tuple2.of("world", 1L), Tuple2.of("nice", 6L), Tuple2.of("girl", 3L), Tuple2.of("haha", 2L));
+        SingleOutputStreamOperator<String> stringStream = tuple2DataStreamSource.map(tuple -> tuple.f0).returns(String.class);
+        stringStream.print();
+
+
         streamExecutionEnvironment.execute();
     }
 }
