@@ -6,3 +6,6 @@ spring:
         max-size: 200
         core-size: 100
         queue-capacity: 50
+
+logging:
+  config: "classpath:log4j2-spring.xml"

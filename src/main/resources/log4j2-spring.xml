@@ -81,6 +81,11 @@
             <appender-ref ref="RollingFileError"/>
         </asyncRoot>
 
+        <asyncLogger name="org.apache.http" additivity="false" level="debug">
+            <appender-ref ref="Console"/>
+            <appender-ref ref="RollingFileDebug"/>
+        </asyncLogger>
+
     </loggers>
 
 </configuration>

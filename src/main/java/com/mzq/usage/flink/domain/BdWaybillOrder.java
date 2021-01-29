@@ -1,10 +1,12 @@
 package com.mzq.usage.flink.domain;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 
 import java.util.Date;
 
 @Data
+@JsonInclude(value = JsonInclude.Include.NON_NULL)
 public class BdWaybillOrder {
 
     private String waybillCode;
@@ -19,4 +21,5 @@ public class BdWaybillOrder {
     private String orderCode;
     private Date orderCreateDate;
     private String packageCode;
+    private Long timestamp;
 }

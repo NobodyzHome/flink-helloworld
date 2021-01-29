@@ -6,14 +6,134 @@ services:
     ports:
       - "2181:2181"
     container_name: my-zookeeper
+    networks:
+      - my-network
 
   kafka:
     image: wurstmeister/kafka
     ports:
       - "9092:9092"
     environment:
-      KAFKA_ADVERTISED_HOST_NAME: localhost
+      KAFKA_ADVERTISED_HOST_NAME: kafak
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
     depends_on:
       - zookeeper
     container_name: my-kafka
+    networks:
+      - my-network
+
+  my-kibana:
+    image: docker.elastic.co/kibana/kibana:7.10.0
+    container_name: ilike-kibana
+    environment:
+      SERVER_NAME: myKibana
+      ELASTICSEARCH_HOSTS: "http://my-elasticsearch:9200"
+    ports:
+      - "5601:5601"
+    networks:
+      - my-network
+    # 表明这个service需要在指定service启动之后再启动
+    depends_on:
+      - my-elasticsearch
+
+
+  # my-elasticsearch是这个service的名称，也是这个docker的域名，其他docker可以通过使用这个域名来访问这个docker。
+  # 例如my-kibana这个service配置了http://my-elasticsearch:9200，其中my-elasticsearch就是这个docker的域名
+  my-elasticsearch:
+    # 这个service使用的镜像
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.0
+    # 这个service创建的docker的名称。相当于docker --name 选项
+    container_name: ilike-elasticsearch
+    # 为这个docker配置的环境变量。相当于docker -e 选项
+    environment:
+      discovery.type: single-node
+    # 为这个docker配置的端口映射。相当于docker -p 选项
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    # 配置这个service所加入的网络。只有加入到同一个network的多个service才可以互相访问
+    # 其实这里也可以不配置，因为不配置的话，默认就让所有service走一个network，那么走默认的即可。这里只是为了展示networks的用法。
+    networks:
+      - my-network
+
+  # 配置jobManager
+  flink-jobmanager:
+    # 使用镜像flink，注意：该镜像的dockerfile默认执行的command是help，在实际使用这个镜像时，应根据需要使用command命令覆盖为：jobmanager、taskmanager等命令
+    image: flink
+    container_name: my-flink-jobmanager
+    # 8081应该暴露给宿主机，供宿主机访问flink ui页面
+    ports:
+      - 8081:8081
+    # 把宿主机的存储job jar包的目录挂载到虚拟机的一个目录上，这样就可以进入到jobManager中使用flink命令进行任务的提交了
+    volumes:
+      - "/Users/maziqiang/IdeaProjects/flink-helloworld/target:/my-volume"
+    networks:
+      - my-network
+    # 默认情况下，镜像flink的docker-file执行的command的是help，我们要通过覆盖这个命令，覆盖为jobManager，告诉flink镜像，应该执行创建jobManager的命令
+    command: jobmanager
+    # jobManager监听6123端口获取taskManager的心跳、任务状态等数据。因此jobManager需要把6123端口暴露出来，供taskManager发送向该端口数据。
+    expose:
+      - 6123
+    environment:
+      # 配置jobmanager的访问地址，也就是当前service名称，作为访问的域名
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+
+  # 配置第一个taskManager
+  flink-taskmanager-1:
+    image: flink
+    container_name: my-flink-taskmanager-1
+    networks:
+      - my-network
+    environment:
+      # 配置该taskManager要连接到的jobManager的地址
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      # 配置每个taskManager包含几个slot
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=5
+    depends_on:
+      - flink-jobmanager
+    # 替换flink镜像的默认command，替换为taskManager，代表告诉flink镜像创建taskManager
+    command: taskmanager
+    # taskManager监听6121、6122端口，获取从jobmanager发来的deploy/cancel/stop task、trigger checkpoint等内容。因此需要把6121、6122端口暴露出来，供jobManager向这两个端口发送数据
+    expose:
+      - 6121
+      - 6122
+
+  # 配置第二个taskManager
+  flink-taskmanager-2:
+    image: flink
+    container_name: my-flink-taskmanager-2
+    networks:
+      - my-network
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=5
+    expose:
+      - 6121
+      - 6122
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+
+  # 配置第三个taskManager
+  flink-taskmanager-3:
+    image: flink
+    container_name: my-flink-taskmanager-3
+    networks:
+      - my-network
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=5
+    depends_on:
+      - flink-jobmanager
+    expose:
+      - 6121
+      - 6122
+    command: taskmanager
+
+
+# 配置自己的network，其实这里也可以不配置，因为本来就想让所有service走一个network，那么走默认的即可。这里只是为了展示networks的用法。
+networks:
+  # 这个是配置的network的名称，service使用该名称来加入这个网络
+  my-network:
+    # 这个是这个network所使用的driver，目前基础的好像只有bridge和host这两个driver，一般本地连的话用bridge就可以了
+    driver: bridge

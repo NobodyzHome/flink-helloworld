@@ -1,264 +1,179 @@
 package com.mzq.usage.flink;
 
-import com.mzq.usage.flink.domain.*;
-import com.mzq.usage.flink.func.source.*;
-import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.functions.ReduceFunction;
-import org.apache.flink.api.common.state.*;
-import org.apache.flink.api.common.typeinfo.Types;
-import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.flink.api.java.tuple.Tuple3;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mzq.usage.flink.domain.BdWaybillOrder;
+import com.mzq.usage.flink.util.GenerateDomainUtils;
+import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.serialization.SerializationSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
-import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
-import org.apache.flink.util.Collector;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.streaming.connectors.elasticsearch.ElasticsearchSinkBase;
+import org.apache.flink.streaming.connectors.elasticsearch.ElasticsearchSinkFunction;
+import org.apache.flink.streaming.connectors.elasticsearch.RequestIndexer;
+import org.apache.flink.streaming.connectors.elasticsearch.util.RetryRejectedExecutionFailureHandler;
+import org.apache.flink.streaming.connectors.elasticsearch7.ElasticsearchSink;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
+import org.apache.flink.streaming.connectors.kafka.KafkaSerializationSchema;
+import org.apache.http.HttpHost;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.elasticsearch.action.update.UpdateRequest;
+import org.elasticsearch.client.*;
+import org.elasticsearch.client.indices.CreateIndexRequest;
+import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.common.xcontent.XContentType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.Date;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
+import java.util.Collections;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 public class HelloWorldFlink {
 
+    private static final Logger logger = LoggerFactory.getLogger(HelloWorldFlink.class);
+    private static final String BD_WAYBILL_ORDER_SETTINGS = "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":1},\"mappings\":{\"properties\":{\"waybillCode\":{\"type\":\"keyword\"},\"waybillSign\":{\"type\":\"keyword\"},\"siteCode\":{\"type\":\"keyword\"},\"siteName\":{\"type\":\"keyword\"},\"busiNo\":{\"type\":\"keyword\"},\"busiName\":{\"type\":\"keyword\"},\"sendPay\":{\"type\":\"keyword\"},\"pickupDate\":{\"type\":\"date\"},\"deliveryDate\":{\"type\":\"date\"},\"orderCode\":{\"type\":\"keyword\"},\"orderCreateDate\":{\"type\":\"date\"},\"packageCode\":{\"type\":\"keyword\"},\"timestamp\":{\"type\":\"date\"}}}}";
+
     @SuppressWarnings("deprecation")
     public static void main(String[] args) throws Exception {
+        RestClientBuilder clientBuilder = RestClient.builder(HttpHost.create("my-elasticsearch:9200"));
+        clientBuilder.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
+        RestHighLevelClient restHighLevelClient = new RestHighLevelClient(clientBuilder);
+        IndicesClient indicesClient = restHighLevelClient.indices();
+        boolean exists = indicesClient.exists(new GetIndexRequest("bd_waybill_order"), RequestOptions.DEFAULT);
+        if (exists) {
+            indicesClient.delete(new DeleteIndexRequest("bd_waybill_order"), RequestOptions.DEFAULT);
+        }
+        indicesClient.create(new CreateIndexRequest("bd_waybill_order").source(BD_WAYBILL_ORDER_SETTINGS, XContentType.JSON), RequestOptions.DEFAULT);
+
         StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<WaybillC> waybillCDataStreamSource = streamExecutionEnvironment.addSource(new WaybillCSource());
-        DataStreamSource<WaybillE> waybillEDataStreamSource = streamExecutionEnvironment.addSource(new WaybillESource());
-        DataStreamSource<WaybillM> waybillMDataStreamSource = streamExecutionEnvironment.addSource(new WaybillMSource());
-        DataStreamSource<WaybillOrder> waybillOrderDataStreamSource = streamExecutionEnvironment.addSource(new WaybillOrderSource());
-        DataStreamSource<Order> orderDataStreamSource = streamExecutionEnvironment.addSource(new OrderSource());
-        DataStreamSource<WaybillRouteLink> waybillRouteLinkDataStreamSource = streamExecutionEnvironment.addSource(new WaybillRouteLinkSource());
+        DataStreamSource<BdWaybillOrder> bdWaybillOrderDataStreamSource = streamExecutionEnvironment.addSource(new RichParallelSourceFunction<BdWaybillOrder>() {
+            private boolean isRunning;
 
-        SingleOutputStreamOperator<WaybillCEM> waybillCMap = waybillCDataStreamSource.map(new MapFunction<WaybillC, WaybillCEM>() {
             @Override
-            public WaybillCEM map(WaybillC value) throws Exception {
-                WaybillCEM waybillCEM = new WaybillCEM();
-                waybillCEM.setWaybillCode(value.getWaybillCode());
-                waybillCEM.setWaybillSign(value.getWaybillSign());
-                waybillCEM.setSiteCode(value.getSiteCode());
-                waybillCEM.setSiteName(value.getSiteName());
-                return waybillCEM;
+            public void open(Configuration parameters) throws Exception {
+                super.open(parameters);
+                isRunning = true;
             }
-        }).setParallelism(2);
 
-        SingleOutputStreamOperator<WaybillCEM> waybillEMap = waybillEDataStreamSource.map(new MapFunction<WaybillE, WaybillCEM>() {
             @Override
-            public WaybillCEM map(WaybillE value) throws Exception {
-                WaybillCEM waybillCEM = new WaybillCEM();
-                waybillCEM.setWaybillCode(value.getWaybillCode());
-                waybillCEM.setBusiNo(value.getBusiNo());
-                waybillCEM.setBusiName(value.getBusiName());
-                waybillCEM.setSendPay(value.getSendPay());
-                return waybillCEM;
+            public void run(SourceContext<BdWaybillOrder> ctx) throws Exception {
+                while (isRunning) {
+                    ctx.collect(GenerateDomainUtils.generateBdWaybillOrder());
+                    Thread.sleep(600);
+                }
+            }
+
+            @Override
+            public void cancel() {
+                isRunning = false;
             }
         }).setParallelism(3);
 
-        SingleOutputStreamOperator<WaybillCEM> waybillMMap = waybillMDataStreamSource.map(new MapFunction<WaybillM, WaybillCEM>() {
+        Properties properties = new Properties();
+        properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        FlinkKafkaProducer<BdWaybillOrder> flinkKafkaProducer = new FlinkKafkaProducer<>("bd_waybill", new KafkaSerializationSchema<BdWaybillOrder>() {
+            private ObjectMapper objectMapper;
+
             @Override
-            public WaybillCEM map(WaybillM value) throws Exception {
-                WaybillCEM waybillCEM = new WaybillCEM();
-                waybillCEM.setWaybillCode(value.getWaybillCode());
-                waybillCEM.setPickupDate(value.getPickupDate());
-                waybillCEM.setDeliveryDate(value.getDeliveryDate());
-                return waybillCEM;
+            public void open(SerializationSchema.InitializationContext context) throws Exception {
+                objectMapper = new ObjectMapper();
             }
-        }).setParallelism(4);
 
-        SingleOutputStreamOperator<WaybillCEM> waybillCEMStream = waybillCMap.union(waybillEMap, waybillMMap).keyBy(WaybillCEM::getWaybillCode).reduce(new ReduceFunction<WaybillCEM>() {
             @Override
-            public WaybillCEM reduce(WaybillCEM value1, WaybillCEM value2) throws Exception {
-                Optional.ofNullable(value1.getWaybillCode()).ifPresent(value2::setWaybillCode);
-                Optional.ofNullable(value1.getWaybillSign()).ifPresent(value2::setWaybillSign);
-                Optional.ofNullable(value1.getSiteCode()).ifPresent(value2::setSiteCode);
-                Optional.ofNullable(value1.getSiteName()).ifPresent(value2::setSiteName);
-                Optional.ofNullable(value1.getBusiName()).ifPresent(value2::setBusiName);
-                Optional.ofNullable(value1.getBusiNo()).ifPresent(value2::setBusiNo);
-                Optional.ofNullable(value1.getSendPay()).ifPresent(value2::setSendPay);
-                Optional.ofNullable(value1.getDeliveryDate()).ifPresent(value2::setDeliveryDate);
-                Optional.ofNullable(value1.getPickupDate()).ifPresent(value2::setPickupDate);
+            public ProducerRecord<byte[], byte[]> serialize(BdWaybillOrder element, Long timestamp) {
+                try {
+                    return new ProducerRecord<>("bd_waybill", element.getWaybillCode().getBytes(), objectMapper.writeValueAsBytes(element));
+                } catch (JsonProcessingException e) {
+                    e.printStackTrace();
+                }
 
-                return value2;
+                return null;
             }
-        }).setParallelism(3);
+        }, properties, FlinkKafkaProducer.Semantic.NONE);
+        bdWaybillOrderDataStreamSource.addSink(flinkKafkaProducer).setParallelism(5);
 
-        SingleOutputStreamOperator<WaybillCEMRouteLink> waybillCEMRouteLinkStream = waybillCEMStream.connect(waybillRouteLinkDataStreamSource)
-                .keyBy(WaybillCEM::getWaybillCode, WaybillRouteLink::getWaybillCode)
-                .flatMap(new RichCoFlatMapFunction<WaybillCEM, WaybillRouteLink, WaybillCEMRouteLink>() {
-                    private ValueState<WaybillCEM> waybillCEMState;
-                    private MapState<String, Date> packageState;
+        Properties consumerConfig = new Properties();
+        consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "myGroup");
+        consumerConfig.put(ConsumerConfig.CLIENT_ID_CONFIG, "myClient");
+        consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        FlinkKafkaConsumer<BdWaybillOrder> consumer = new FlinkKafkaConsumer<>("bd_waybill", new KafkaDeserializationSchema<BdWaybillOrder>() {
+            private ObjectMapper objectMapper;
 
-                    @Override
-                    public void open(Configuration parameters) throws Exception {
-                        waybillCEMState = getRuntimeContext().getState(new ValueStateDescriptor<>("waybill-cem-state", Types.GENERIC(WaybillCEM.class)));
-                        packageState = getRuntimeContext().getMapState(new MapStateDescriptor<>("route-link-state", Types.STRING, Types.GENERIC(Date.class)));
-                    }
+            @Override
+            public TypeInformation<BdWaybillOrder> getProducedType() {
+                return TypeInformation.of(BdWaybillOrder.class);
+            }
 
-                    @Override
-                    public void flatMap1(WaybillCEM value, Collector<WaybillCEMRouteLink> out) throws Exception {
-                        waybillCEMState.update(value);
+            @Override
+            public void open(DeserializationSchema.InitializationContext context) throws Exception {
+                objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+            }
 
-                        WaybillCEMRouteLink waybillCEMRouteLink = new WaybillCEMRouteLink();
-                        waybillCEMRouteLink.setWaybillCode(value.getWaybillCode());
-                        waybillCEMRouteLink.setWaybillSign(value.getWaybillSign());
-                        waybillCEMRouteLink.setSiteCode(value.getSiteCode());
-                        waybillCEMRouteLink.setSiteName(value.getSiteName());
-                        waybillCEMRouteLink.setBusiNo(value.getBusiNo());
-                        waybillCEMRouteLink.setBusiName(value.getBusiName());
-                        waybillCEMRouteLink.setSendPay(value.getSendPay());
-                        waybillCEMRouteLink.setPickupDate(value.getPickupDate());
-                        waybillCEMRouteLink.setDeliveryDate(value.getDeliveryDate());
+            @Override
+            public boolean isEndOfStream(BdWaybillOrder nextElement) {
+                return false;
+            }
 
-                        boolean hasPackage = false;
-                        for (Map.Entry<String, Date> entry : packageState.entries()) {
-                            waybillCEMRouteLink.setPackageCode(entry.getKey());
-                            waybillCEMRouteLink.setStaticDeliveryTime(entry.getValue());
-                            hasPackage = true;
-                            out.collect(waybillCEMRouteLink);
-                        }
+            @Override
+            public BdWaybillOrder deserialize(ConsumerRecord<byte[], byte[]> record) throws Exception {
+                return objectMapper.readValue(record.value(), BdWaybillOrder.class);
+            }
+        }, consumerConfig);
 
-                        if (hasPackage) {
-                            packageState.clear();
-                        } else {
-                            out.collect(waybillCEMRouteLink);
-                        }
-                    }
+        DataStreamSource<BdWaybillOrder> bdWaybillOrderDataStreamKafkaSource = streamExecutionEnvironment.addSource(consumer).setParallelism(10);
+        ElasticsearchSink.Builder<BdWaybillOrder> esBuilder = new ElasticsearchSink.Builder<>(Collections.singletonList(HttpHost.create("my-elasticsearch:9200")), new ElasticsearchSinkFunction<BdWaybillOrder>() {
+            private ObjectMapper objectMapper;
 
-                    @Override
-                    public void flatMap2(WaybillRouteLink value, Collector<WaybillCEMRouteLink> out) throws Exception {
-                        WaybillCEM waybillCEM = waybillCEMState.value();
-                        if (Objects.nonNull(waybillCEM)) {
-                            WaybillCEMRouteLink waybillCEMRouteLink = new WaybillCEMRouteLink();
-                            waybillCEMRouteLink.setWaybillCode(waybillCEM.getWaybillCode());
-                            waybillCEMRouteLink.setWaybillSign(waybillCEM.getWaybillSign());
-                            waybillCEMRouteLink.setSiteCode(waybillCEM.getSiteCode());
-                            waybillCEMRouteLink.setSiteName(waybillCEM.getSiteName());
-                            waybillCEMRouteLink.setBusiNo(waybillCEM.getBusiNo());
-                            waybillCEMRouteLink.setBusiName(waybillCEM.getBusiName());
-                            waybillCEMRouteLink.setSendPay(waybillCEM.getSendPay());
-                            waybillCEMRouteLink.setPickupDate(waybillCEM.getPickupDate());
-                            waybillCEMRouteLink.setDeliveryDate(waybillCEM.getDeliveryDate());
-                            waybillCEMRouteLink.setPackageCode(value.getPackageCode());
-                            waybillCEMRouteLink.setStaticDeliveryTime(value.getStaticDeliveryTime());
+            @Override
+            public void open() {
+                objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+            }
 
-                            out.collect(waybillCEMRouteLink);
-                        } else {
-                            packageState.put(value.getPackageCode(), value.getStaticDeliveryTime());
-                        }
-                    }
-                }).setParallelism(5);
+            @Override
+            public void process(BdWaybillOrder bdWaybillOrder, RuntimeContext runtimeContext, RequestIndexer requestIndexer) {
+                try {
+                    String json = objectMapper.writeValueAsString(bdWaybillOrder);
+                    UpdateRequest updateRequest = new UpdateRequest("bd_waybill_order", bdWaybillOrder.getWaybillCode()).doc(json, XContentType.JSON).docAsUpsert(true);;
+                    requestIndexer.add(updateRequest);
+                } catch (JsonProcessingException e) {
+                    e.printStackTrace();
+                }
+            }
+        });
 
-        SingleOutputStreamOperator<Tuple3<String, String, Date>> orderStream = waybillOrderDataStreamSource.connect(orderDataStreamSource)
-                .keyBy(WaybillOrder::getOrderId, Order::getOrderCode)
-                .flatMap(new RichCoFlatMapFunction<WaybillOrder, Order, Tuple3<String, String, Date>>() {
-                    private ListState<String> waybillListState;
-                    private ValueState<Date> valueState;
-
-                    @Override
-                    public void open(Configuration parameters) throws Exception {
-                        waybillListState = getRuntimeContext().getListState(new ListStateDescriptor<String>("waybill-list", Types.STRING));
-                        valueState = getRuntimeContext().getState(new ValueStateDescriptor<Date>("order-state", Types.GENERIC(Date.class)));
-                    }
-
-                    @Override
-                    public void flatMap1(WaybillOrder value, Collector<Tuple3<String, String, Date>> out) throws Exception {
-                        Date staticDeliveryDate = valueState.value();
-                        out.collect(Tuple3.of(value.getWaybillCode(), value.getOrderId(), staticDeliveryDate));
-
-                        if (Objects.isNull(staticDeliveryDate)) {
-                            waybillListState.add(value.getWaybillCode());
-                        }
-                    }
-
-                    @Override
-                    public void flatMap2(Order value, Collector<Tuple3<String, String, Date>> out) throws Exception {
-                        valueState.update(value.getCreateTime());
-                        boolean hasWaybill = false;
-                        for (String waybillCode : waybillListState.get()) {
-                            out.collect(Tuple3.of(waybillCode, value.getOrderCode(), value.getCreateTime()));
-                            hasWaybill = true;
-                        }
-                        if (hasWaybill) {
-                            waybillListState.clear();
-                        }
-                    }
-                }).setParallelism(3);
-
-        SingleOutputStreamOperator<BdWaybillOrder> bdWaybillOrderStream = waybillCEMRouteLinkStream.connect(orderStream)
-                .keyBy(WaybillCEMRouteLink::getWaybillCode, new KeySelector<Tuple3<String, String, Date>, String>() {
-                    @Override
-                    public String getKey(Tuple3<String, String, Date> value) throws Exception {
-                        return value.f0;
-                    }
-                }).flatMap(new RichCoFlatMapFunction<WaybillCEMRouteLink, Tuple3<String, String, Date>, BdWaybillOrder>() {
-                    private ListState<WaybillCEMRouteLink> routeLinkState;
-                    private ValueState<Order> orderState;
-
-                    @Override
-                    public void open(Configuration parameters) throws Exception {
-                        routeLinkState = getRuntimeContext().getListState(new ListStateDescriptor<WaybillCEMRouteLink>("waybill-state", Types.GENERIC(WaybillCEMRouteLink.class)));
-                        orderState = getRuntimeContext().getState(new ValueStateDescriptor<Order>("order-state", Types.GENERIC(Order.class)));
-                    }
-
-                    @Override
-                    public void flatMap1(WaybillCEMRouteLink value, Collector<BdWaybillOrder> out) throws Exception {
-                        Order order = orderState.value();
-                        if (Objects.isNull(order)) {
-                            routeLinkState.add(value);
-                        } else {
-                            BdWaybillOrder bdWaybillOrder = new BdWaybillOrder();
-                            bdWaybillOrder.setWaybillCode(value.getWaybillCode());
-                            bdWaybillOrder.setWaybillSign(value.getWaybillSign());
-                            bdWaybillOrder.setSiteCode(value.getSiteCode());
-                            bdWaybillOrder.setSiteName(value.getSiteName());
-                            bdWaybillOrder.setBusiNo(value.getBusiNo());
-                            bdWaybillOrder.setBusiName(value.getBusiName());
-                            bdWaybillOrder.setSendPay(value.getSendPay());
-                            bdWaybillOrder.setPickupDate(value.getPickupDate());
-                            bdWaybillOrder.setDeliveryDate(value.getDeliveryDate());
-                            bdWaybillOrder.setPackageCode(value.getPackageCode());
-                            bdWaybillOrder.setOrderCode(order.getOrderCode());
-                            bdWaybillOrder.setOrderCreateDate(order.getCreateTime());
-
-                            out.collect(bdWaybillOrder);
-                        }
-                    }
-
-                    @Override
-                    public void flatMap2(Tuple3<String, String, Date> value, Collector<BdWaybillOrder> out) throws Exception {
-                        Order order = new Order();
-                        order.setOrderCode(value.f1);
-                        order.setCreateTime(value.f2);
-                        orderState.update(order);
-
-                        boolean hasWaybill = false;
-                        for (WaybillCEMRouteLink waybillCEMRouteLink : routeLinkState.get()) {
-                            BdWaybillOrder bdWaybillOrder = new BdWaybillOrder();
-                            bdWaybillOrder.setWaybillCode(waybillCEMRouteLink.getWaybillCode());
-                            bdWaybillOrder.setWaybillSign(waybillCEMRouteLink.getWaybillSign());
-                            bdWaybillOrder.setSiteCode(waybillCEMRouteLink.getSiteCode());
-                            bdWaybillOrder.setSiteName(waybillCEMRouteLink.getSiteName());
-                            bdWaybillOrder.setBusiNo(waybillCEMRouteLink.getBusiNo());
-                            bdWaybillOrder.setBusiName(waybillCEMRouteLink.getBusiName());
-                            bdWaybillOrder.setSendPay(waybillCEMRouteLink.getSendPay());
-                            bdWaybillOrder.setPickupDate(waybillCEMRouteLink.getPickupDate());
-                            bdWaybillOrder.setDeliveryDate(waybillCEMRouteLink.getDeliveryDate());
-                            bdWaybillOrder.setPackageCode(waybillCEMRouteLink.getPackageCode());
-                            bdWaybillOrder.setOrderCode(order.getOrderCode());
-                            bdWaybillOrder.setOrderCreateDate(order.getCreateTime());
-
-                            out.collect(bdWaybillOrder);
-                            hasWaybill = true;
-                        }
-                        if (hasWaybill) {
-                            routeLinkState.clear();
-                        }
-                    }
-                }).setParallelism(6);
-
-        bdWaybillOrderStream.print();
+        esBuilder.setRestClientFactory(restClientBuilder -> {
+            restClientBuilder.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
+            restClientBuilder.setFailureListener(new RestClient.FailureListener() {
+                @Override
+                public void onFailure(Node node) {
+                    logger.error("访问节点失败！node={}", node);
+                }
+            });
+            restClientBuilder.setRequestConfigCallback(requestConfigBuilder -> requestConfigBuilder.setConnectTimeout(1000).setSocketTimeout(1500).setConnectionRequestTimeout(800));
+            restClientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder.setMaxConnTotal(200));
+        });
+        esBuilder.setBulkFlushMaxActions(10);
+        esBuilder.setBulkFlushMaxSizeMb(5);
+        esBuilder.setBulkFlushInterval(TimeUnit.SECONDS.toMillis(20));
+        esBuilder.setFailureHandler(new RetryRejectedExecutionFailureHandler());
+        esBuilder.setBulkFlushBackoff(true);
+        esBuilder.setBulkFlushBackoffDelay(TimeUnit.SECONDS.toMillis(5));
+        esBuilder.setBulkFlushBackoffRetries(3);
+        esBuilder.setBulkFlushBackoffType(ElasticsearchSinkBase.FlushBackoffType.CONSTANT);
+        bdWaybillOrderDataStreamKafkaSource.addSink(esBuilder.build()).setParallelism(12);
         streamExecutionEnvironment.execute();
     }
 }
