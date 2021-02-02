@@ -23,15 +23,24 @@ import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
 import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
 import org.apache.flink.streaming.connectors.kafka.KafkaSerializationSchema;
 import org.apache.http.HttpHost;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.impl.client.SystemDefaultCredentialsProvider;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.elasticsearch.action.bulk.*;
+import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.update.UpdateRequest;
 import org.elasticsearch.client.*;
 import org.elasticsearch.client.indices.CreateIndexRequest;
 import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +48,8 @@ import org.slf4j.LoggerFactory;
 import java.util.Collections;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class HelloWorldFlink {
 
@@ -47,19 +58,65 @@ public class HelloWorldFlink {
 
     @SuppressWarnings("deprecation")
     public static void main(String[] args) throws Exception {
-        RestClientBuilder clientBuilder = RestClient.builder(HttpHost.create("my-elasticsearch:9200"));
-        clientBuilder.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
-        RestHighLevelClient restHighLevelClient = new RestHighLevelClient(clientBuilder);
+        RestClientBuilder restClientBuilder = RestClient.builder(HttpHost.create("my-elasticsearch:9200"));
+        restClientBuilder.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
+        restClientBuilder.setFailureListener(new RestClient.FailureListener() {
+            @Override
+            public void onFailure(Node node) {
+                logger.error("访问节点失败！node={}", node);
+            }
+        });
+        restClientBuilder.setRequestConfigCallback(requestConfigBuilder -> requestConfigBuilder.setSocketTimeout(2000).setConnectTimeout(1000).setConnectionRequestTimeout(800));
+        restClientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder.setMaxConnTotal(200));
+        RestHighLevelClient restHighLevelClient = new RestHighLevelClient(restClientBuilder);
+
         IndicesClient indicesClient = restHighLevelClient.indices();
-        boolean exists = indicesClient.exists(new GetIndexRequest("bd_waybill_order"), RequestOptions.DEFAULT);
+        boolean exists = indicesClient.exists(new GetIndexRequest("bd_waybill"), RequestOptions.DEFAULT);
         if (exists) {
-            indicesClient.delete(new DeleteIndexRequest("bd_waybill_order"), RequestOptions.DEFAULT);
+            indicesClient.delete(new DeleteIndexRequest("bd_waybill"), RequestOptions.DEFAULT);
         }
-        indicesClient.create(new CreateIndexRequest("bd_waybill_order").source(BD_WAYBILL_ORDER_SETTINGS, XContentType.JSON), RequestOptions.DEFAULT);
+        indicesClient.create(new CreateIndexRequest("bd_waybill").source(BD_WAYBILL_ORDER_SETTINGS, XContentType.JSON), RequestOptions.DEFAULT);
+
+        BulkProcessor.Builder bulkProcessorBuilder = BulkProcessor.builder((bulkRequest, bulkResponseActionListener) -> restHighLevelClient.bulkAsync(bulkRequest, RequestOptions.DEFAULT, bulkResponseActionListener),
+                new BulkProcessor.Listener() {
+                    @Override
+                    public void beforeBulk(long executionId, BulkRequest request) {
+                        logger.debug("即将执行bulk操作。executionId={}", executionId);
+                    }
+
+                    @Override
+                    public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+                        logger.info("执行bulk操作成功。executionId={}，执行用时={}，处理成功docId={}，是否有处理失败={}，处理失败信息：{}", executionId, response.getTook()
+                                , Stream.of(response.getItems()).map(BulkItemResponse::getId).collect(Collectors.joining(",")), response.hasFailures(), response.buildFailureMessage());
+                    }
+
+                    @Override
+                    public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+                        logger.error("执行bulk操作异常。executionId={}", executionId, failure);
+                    }
+                });
+        bulkProcessorBuilder.setBulkActions(11);
+        bulkProcessorBuilder.setBulkSize(new ByteSizeValue(5, ByteSizeUnit.MB));
+        bulkProcessorBuilder.setFlushInterval(TimeValue.timeValueSeconds(30));
+        bulkProcessorBuilder.setBackoffPolicy(BackoffPolicy.constantBackoff(TimeValue.timeValueSeconds(3), 2));
+        BulkProcessor bulkProcessor = bulkProcessorBuilder.build();
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        for (BdWaybillOrder bdWaybillOrder : GenerateDomainUtils.generateBdWaybillOrders(30)) {
+            String json = objectMapper.writeValueAsString(bdWaybillOrder);
+            IndexRequest indexRequest = new IndexRequest("bd_waybill").id(bdWaybillOrder.getWaybillCode()).source(json, XContentType.JSON);
+            bulkProcessor.add(indexRequest);
+        }
+
+        Thread.sleep(TimeUnit.SECONDS.toMillis(3));
+        bulkProcessor.close();
+
+        Thread.sleep(TimeUnit.SECONDS.toMillis(2));
+        restHighLevelClient.close();
 
         StreamExecutionEnvironment streamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<BdWaybillOrder> bdWaybillOrderDataStreamSource = streamExecutionEnvironment.addSource(new RichParallelSourceFunction<BdWaybillOrder>() {
-            private boolean isRunning;
+        DataStreamSource<BdWaybillOrder> produceSourceStream = streamExecutionEnvironment.addSource(new RichParallelSourceFunction<BdWaybillOrder>() {
+            private boolean isRunning = false;
 
             @Override
             public void open(Configuration parameters) throws Exception {
@@ -71,7 +128,7 @@ public class HelloWorldFlink {
             public void run(SourceContext<BdWaybillOrder> ctx) throws Exception {
                 while (isRunning) {
                     ctx.collect(GenerateDomainUtils.generateBdWaybillOrder());
-                    Thread.sleep(600);
+                    Thread.sleep(TimeUnit.SECONDS.toMillis(1));
                 }
             }
 
@@ -79,11 +136,11 @@ public class HelloWorldFlink {
             public void cancel() {
                 isRunning = false;
             }
-        }).setParallelism(3);
+        }).setParallelism(5);
 
-        Properties properties = new Properties();
-        properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
-        FlinkKafkaProducer<BdWaybillOrder> flinkKafkaProducer = new FlinkKafkaProducer<>("bd_waybill", new KafkaSerializationSchema<BdWaybillOrder>() {
+        Properties producerConfig = new Properties();
+        producerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        FlinkKafkaProducer<BdWaybillOrder> kafkaProducer = new FlinkKafkaProducer<>("bd_waybill", new KafkaSerializationSchema<BdWaybillOrder>() {
             private ObjectMapper objectMapper;
 
             @Override
@@ -96,26 +153,19 @@ public class HelloWorldFlink {
                 try {
                     return new ProducerRecord<>("bd_waybill", element.getWaybillCode().getBytes(), objectMapper.writeValueAsBytes(element));
                 } catch (JsonProcessingException e) {
-                    e.printStackTrace();
+                    throw new IllegalStateException(e);
                 }
-
-                return null;
             }
-        }, properties, FlinkKafkaProducer.Semantic.NONE);
-        bdWaybillOrderDataStreamSource.addSink(flinkKafkaProducer).setParallelism(5);
+        }, producerConfig, FlinkKafkaProducer.Semantic.EXACTLY_ONCE);
+        produceSourceStream.addSink(kafkaProducer).setParallelism(8);
 
-        Properties consumerConfig = new Properties();
-        consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
-        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "myGroup");
-        consumerConfig.put(ConsumerConfig.CLIENT_ID_CONFIG, "myClient");
-        consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        FlinkKafkaConsumer<BdWaybillOrder> consumer = new FlinkKafkaConsumer<>("bd_waybill", new KafkaDeserializationSchema<BdWaybillOrder>() {
+        Properties consumerProperties = new Properties();
+        consumerProperties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        consumerProperties.put(ConsumerConfig.GROUP_ID_CONFIG, "hello-world-group");
+        consumerProperties.put(ConsumerConfig.CLIENT_ID_CONFIG, "hello-world");
+        consumerProperties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        FlinkKafkaConsumer<BdWaybillOrder> kafkaConsumer = new FlinkKafkaConsumer<>("bd_waybill", new KafkaDeserializationSchema<BdWaybillOrder>() {
             private ObjectMapper objectMapper;
-
-            @Override
-            public TypeInformation<BdWaybillOrder> getProducedType() {
-                return TypeInformation.of(BdWaybillOrder.class);
-            }
 
             @Override
             public void open(DeserializationSchema.InitializationContext context) throws Exception {
@@ -131,49 +181,57 @@ public class HelloWorldFlink {
             public BdWaybillOrder deserialize(ConsumerRecord<byte[], byte[]> record) throws Exception {
                 return objectMapper.readValue(record.value(), BdWaybillOrder.class);
             }
-        }, consumerConfig);
-
-        DataStreamSource<BdWaybillOrder> bdWaybillOrderDataStreamKafkaSource = streamExecutionEnvironment.addSource(consumer).setParallelism(10);
-        ElasticsearchSink.Builder<BdWaybillOrder> esBuilder = new ElasticsearchSink.Builder<>(Collections.singletonList(HttpHost.create("my-elasticsearch:9200")), new ElasticsearchSinkFunction<BdWaybillOrder>() {
-            private ObjectMapper objectMapper;
 
             @Override
-            public void open() {
-                objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+            public TypeInformation<BdWaybillOrder> getProducedType() {
+                return TypeInformation.of(BdWaybillOrder.class);
             }
+        }, consumerProperties);
 
-            @Override
-            public void process(BdWaybillOrder bdWaybillOrder, RuntimeContext runtimeContext, RequestIndexer requestIndexer) {
-                try {
-                    String json = objectMapper.writeValueAsString(bdWaybillOrder);
-                    UpdateRequest updateRequest = new UpdateRequest("bd_waybill_order", bdWaybillOrder.getWaybillCode()).doc(json, XContentType.JSON).docAsUpsert(true);;
-                    requestIndexer.add(updateRequest);
-                } catch (JsonProcessingException e) {
-                    e.printStackTrace();
-                }
-            }
-        });
+        DataStreamSource<BdWaybillOrder> bdWaybillOrderConsumerSource = streamExecutionEnvironment.addSource(kafkaConsumer).setParallelism(10);
+        ElasticsearchSink.Builder<BdWaybillOrder> elasticsearchSinkBuilder = new ElasticsearchSink.Builder<>(Collections.singletonList(HttpHost.create("my-elasticsearch:9200")),
+                new ElasticsearchSinkFunction<BdWaybillOrder>() {
+                    private ObjectMapper objectMapper;
 
-        esBuilder.setRestClientFactory(restClientBuilder -> {
-            restClientBuilder.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
-            restClientBuilder.setFailureListener(new RestClient.FailureListener() {
-                @Override
-                public void onFailure(Node node) {
-                    logger.error("访问节点失败！node={}", node);
-                }
+                    @Override
+                    public void open() {
+                        objectMapper = new ObjectMapper();
+                    }
+
+                    @Override
+                    public void process(BdWaybillOrder bdWaybillOrder, RuntimeContext runtimeContext, RequestIndexer requestIndexer) {
+                        try {
+                            UpdateRequest updateRequest = new UpdateRequest("bd_waybill_order", bdWaybillOrder.getWaybillCode());
+                            updateRequest.doc(objectMapper.writeValueAsString(bdWaybillOrder), XContentType.JSON).docAsUpsert(true).retryOnConflict(5);
+                            requestIndexer.add(updateRequest);
+                        } catch (JsonProcessingException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                });
+        elasticsearchSinkBuilder.setRestClientFactory(restClientBuilder1 -> {
+            restClientBuilder1.setNodeSelector(NodeSelector.SKIP_DEDICATED_MASTERS);
+            restClientBuilder1.setRequestConfigCallback(requestConfigBuilder -> requestConfigBuilder.setConnectTimeout(1000).setSocketTimeout(2000).setConnectionRequestTimeout(800));
+            restClientBuilder1.setHttpClientConfigCallback(httpClientBuilder -> {
+                httpClientBuilder.setMaxConnTotal(200);
+                SystemDefaultCredentialsProvider systemDefaultCredentialsProvider = new SystemDefaultCredentialsProvider();
+                systemDefaultCredentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials("user", "pass"));
+                httpClientBuilder.setDefaultCredentialsProvider(systemDefaultCredentialsProvider);
+
+                return httpClientBuilder;
             });
-            restClientBuilder.setRequestConfigCallback(requestConfigBuilder -> requestConfigBuilder.setConnectTimeout(1000).setSocketTimeout(1500).setConnectionRequestTimeout(800));
-            restClientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder.setMaxConnTotal(200));
         });
-        esBuilder.setBulkFlushMaxActions(10);
-        esBuilder.setBulkFlushMaxSizeMb(5);
-        esBuilder.setBulkFlushInterval(TimeUnit.SECONDS.toMillis(20));
-        esBuilder.setFailureHandler(new RetryRejectedExecutionFailureHandler());
-        esBuilder.setBulkFlushBackoff(true);
-        esBuilder.setBulkFlushBackoffDelay(TimeUnit.SECONDS.toMillis(5));
-        esBuilder.setBulkFlushBackoffRetries(3);
-        esBuilder.setBulkFlushBackoffType(ElasticsearchSinkBase.FlushBackoffType.CONSTANT);
-        bdWaybillOrderDataStreamKafkaSource.addSink(esBuilder.build()).setParallelism(12);
+
+        elasticsearchSinkBuilder.setBulkFlushMaxActions(100);
+        elasticsearchSinkBuilder.setBulkFlushMaxSizeMb(5);
+        elasticsearchSinkBuilder.setBulkFlushInterval(TimeUnit.SECONDS.toMillis(30));
+        elasticsearchSinkBuilder.setFailureHandler(new RetryRejectedExecutionFailureHandler());
+        elasticsearchSinkBuilder.setBulkFlushBackoff(true);
+        elasticsearchSinkBuilder.setBulkFlushBackoffType(ElasticsearchSinkBase.FlushBackoffType.CONSTANT);
+        elasticsearchSinkBuilder.setBulkFlushBackoffRetries(5);
+        elasticsearchSinkBuilder.setBulkFlushBackoffDelay(TimeUnit.SECONDS.toMillis(3));
+
+        bdWaybillOrderConsumerSource.addSink(elasticsearchSinkBuilder.build()).setParallelism(15);
         streamExecutionEnvironment.execute();
     }
 }
