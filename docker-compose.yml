@@ -130,6 +130,14 @@ services:
       - 6122
     command: taskmanager
 
+  my-redis:
+    image: redis
+    container_name: ilike-redis
+    networks:
+      - my-network
+    ports:
+      - "6379:6379"
+
 
 # 配置自己的network，其实这里也可以不配置，因为本来就想让所有service走一个network，那么走默认的即可。这里只是为了展示networks的用法。
 networks:

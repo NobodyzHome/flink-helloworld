@@ -3,11 +3,12 @@ package com.mzq.usage.flink.domain;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 
+import java.io.Serializable;
 import java.util.Date;
 
 @Data
 @JsonInclude(value = JsonInclude.Include.NON_NULL)
-public class BdWaybillOrder {
+public class BdWaybillOrder implements Serializable {
 
     private String waybillCode;
     private String waybillSign;

@@ -12,6 +12,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.streaming.connectors.elasticsearch.ElasticsearchSinkBase;
 import org.apache.flink.streaming.connectors.elasticsearch.ElasticsearchSinkFunction;
@@ -66,6 +67,7 @@ public class HelloWorldFlink {
                 logger.error("访问节点失败！node={}", node);
             }
         });
+
         restClientBuilder.setRequestConfigCallback(requestConfigBuilder -> requestConfigBuilder.setSocketTimeout(2000).setConnectTimeout(1000).setConnectionRequestTimeout(800));
         restClientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder.setMaxConnTotal(200));
         RestHighLevelClient restHighLevelClient = new RestHighLevelClient(restClientBuilder);
@@ -230,6 +232,20 @@ public class HelloWorldFlink {
         elasticsearchSinkBuilder.setBulkFlushBackoffType(ElasticsearchSinkBase.FlushBackoffType.CONSTANT);
         elasticsearchSinkBuilder.setBulkFlushBackoffRetries(5);
         elasticsearchSinkBuilder.setBulkFlushBackoffDelay(TimeUnit.SECONDS.toMillis(3));
+
+        bdWaybillOrderConsumerSource.addSink(new RichSinkFunction<BdWaybillOrder>() {
+
+
+            @Override
+            public void open(Configuration parameters) throws Exception {
+                super.open(parameters);
+            }
+
+            @Override
+            public void invoke(BdWaybillOrder value, Context context) throws Exception {
+
+            }
+        });
 
         bdWaybillOrderConsumerSource.addSink(elasticsearchSinkBuilder.build()).setParallelism(15);
         streamExecutionEnvironment.execute();

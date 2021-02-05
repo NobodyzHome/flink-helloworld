@@ -105,6 +105,13 @@
             <artifactId>disruptor</artifactId>
             <version>3.4.2</version>
         </dependency>
+
+        <!-- https://mvnrepository.com/artifact/io.lettuce/lettuce-core -->
+        <dependency>
+            <groupId>io.lettuce</groupId>
+            <artifactId>lettuce-core</artifactId>
+            <version>6.0.2.RELEASE</version>
+        </dependency>
     </dependencies>
 
     <properties>
